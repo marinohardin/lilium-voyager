@@ -45,6 +45,18 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include <objc/message.h>
 #endif
 
+#ifdef __APPLE__
+/*
+On macOS, fullscreen is desktop fullscreen: the window covers the display at
+its current resolution. Changing the display mode makes SDL capture all
+displays, which blacks out every other monitor until the game leaves
+fullscreen.
+*/
+#define GLIMP_WINDOW_FULLSCREEN SDL_WINDOW_FULLSCREEN_DESKTOP
+#else
+#define GLIMP_WINDOW_FULLSCREEN SDL_WINDOW_FULLSCREEN
+#endif
+
 typedef enum
 {
 	RSERR_OK,
@@ -397,6 +409,64 @@ static void GLimp_ClearProcAddresses( void ) {
 #undef GLE
 }
 
+#ifdef __APPLE__
+typedef struct { double x, y, w, h; } glimpRect_t;	// NSRect
+
+// height of a standard window's title bar in points
+static int GLimp_TitleBarHeight( void )
+{
+	// NSWindowStyleMaskTitled | Closable | Miniaturizable | Resizable
+	const unsigned long mask = 0xf;
+	glimpRect_t content = { 0, 0, 640, 480 }, frame;
+
+#if defined( __arm64__ ) || defined( __aarch64__ )
+	frame = ((glimpRect_t (*)( id, SEL, glimpRect_t, unsigned long ))objc_msgSend)
+#else
+	frame = ((glimpRect_t (*)( id, SEL, glimpRect_t, unsigned long ))objc_msgSend_stret)
+#endif
+		( (id)objc_getClass( "NSWindow" ), sel_registerName( "frameRectForContentRect:styleMask:" ), content, mask );
+
+	return (int)( frame.h - content.h + 0.5 );
+}
+
+/*
+===============
+GLimp_FitWindowToDisplay
+
+Shrink a window size (in points) that doesn't fit in the display's usable area,
+below the menu bar and beside the Dock, keeping its aspect. Returns qtrue if the
+size was changed.
+===============
+*/
+static qboolean GLimp_FitWindowToDisplay( int display, int *width, int *height )
+{
+	SDL_Rect usable;
+	int maxWidth, maxHeight;
+
+	if ( SDL_GetDisplayUsableBounds( display, &usable ) != 0 || usable.w <= 0 || usable.h <= 0 )
+		return qfalse;
+
+	maxWidth = usable.w;
+	maxHeight = usable.h - GLimp_TitleBarHeight( );
+
+	if ( *width <= maxWidth && *height <= maxHeight )
+		return qfalse;
+
+	if ( *width > maxWidth )
+	{
+		*height = (int)( (float)*height * maxWidth / *width + 0.5f );
+		*width = maxWidth;
+	}
+	if ( *height > maxHeight )
+	{
+		*width = (int)( (float)*width * maxHeight / *height + 0.5f );
+		*height = maxHeight;
+	}
+
+	return qtrue;
+}
+#endif
+
 /*
 ===============
 GLimp_SetMode
@@ -493,6 +563,20 @@ static int GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder, qbool
 	}
 	ri.Printf( PRINT_ALL, " %d %d\n", glConfig.vidWidth, glConfig.vidHeight);
 
+#ifdef __APPLE__
+	// The windowed size must fit on the display, as it's also the size the
+	// window returns to when leaving fullscreen.
+	if ( GLimp_FitWindowToDisplay( display, &glConfig.vidWidth, &glConfig.vidHeight ) )
+	{
+		glConfig.windowAspect = (float)glConfig.vidWidth / (float)glConfig.vidHeight;
+		ri.Printf( PRINT_ALL, "...window fitted to display: %d %d\n", glConfig.vidWidth, glConfig.vidHeight );
+	}
+	if ( x == SDL_WINDOWPOS_UNDEFINED )
+	{
+		x = y = SDL_WINDOWPOS_CENTERED_DISPLAY( display );
+	}
+#endif
+
 	// Center window
 	if( r_centerWindow->integer && !fullscreen )
 	{
@@ -518,7 +602,7 @@ static int GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder, qbool
 
 	if( fullscreen )
 	{
-		flags |= SDL_WINDOW_FULLSCREEN;
+		flags |= GLIMP_WINDOW_FULLSCREEN;
 		glConfig.isFullscreen = qtrue;
 	}
 	else
@@ -709,6 +793,12 @@ static int GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder, qbool
 			continue;
 		}
 
+#ifdef __APPLE__
+		// desktop fullscreen: render at the size the window actually has
+		SDL_GetWindowSize( SDL_window, &glConfig.vidWidth, &glConfig.vidHeight );
+		glConfig.windowAspect = (float)glConfig.vidWidth / (float)glConfig.vidHeight;
+		glConfig.displayFrequency = desktopMode.refresh_rate;
+#else
 		if( fullscreen )
 		{
 			SDL_DisplayMode mode;
@@ -731,6 +821,7 @@ static int GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder, qbool
 				continue;
 			}
 		}
+#endif
 
 		SDL_SetWindowIcon( SDL_window, icon );
 
@@ -1254,9 +1345,11 @@ void GLimp_EndFrame( void )
 	}
 
 #ifdef __APPLE__
-	if( r_fullscreen->modified && GLimp_InFullscreenSpace( ) )
+	if( r_fullscreen->modified && GLimp_InFullscreenSpace( )
+		&& !( SDL_GetWindowFlags( SDL_window ) & SDL_WINDOW_FULLSCREEN ) )
 	{
-		// Alt+Enter in a fullscreen Space: the window looks fullscreen, so leave it
+		// Alt+Enter in a fullscreen Space SDL didn't enter (green button, Ctrl+Cmd+F):
+		// the window looks fullscreen, so leave it
 		ri.Printf( PRINT_ALL, "Leaving macOS fullscreen Space\n" );
 		GLimp_LeaveFullscreenSpace( );
 		ri.Cvar_Set( "r_fullscreen", "0" );
@@ -1286,7 +1379,7 @@ void GLimp_EndFrame( void )
 
 		if( needToToggle )
 		{
-			sdlToggled = SDL_SetWindowFullscreen( SDL_window, r_fullscreen->integer ) >= 0;
+			sdlToggled = SDL_SetWindowFullscreen( SDL_window, r_fullscreen->integer ? GLIMP_WINDOW_FULLSCREEN : 0 ) >= 0;
 
 			// SDL_WM_ToggleFullScreen didn't work, so do it the slow way
 			if( !sdlToggled )
